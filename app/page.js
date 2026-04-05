@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect } from "react";
 
 var STATUS_COLORS = {
   "New Lead": { bg: "#fdab3d", text: "#000" },
