@@ -1,4 +1,4 @@
-"use client";
+
 import { NextResponse } from "next/server";
  
 var CALLRAIL_API_KEY = process.env.CALLRAIL_API_KEY;
