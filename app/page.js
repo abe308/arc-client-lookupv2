@@ -1,8 +1,39 @@
 "use client";
+import { useState, useRef, useEffect } from "react";
 
-import React, { useState, useRef, useEffect } from "react";
+const CALLRAIL_API_KEY = "3c8f93edc04a4be66e47017b1af79277";
+const CALLRAIL_ACCOUNT_ID_CACHE = { id: null };
 
-var STATUS_COLORS = {
+const BOARD_IDS = {
+  inpatientLeads: "1514008919",
+  baysideLeads: "1947645460",
+  inpatientCensus: "1514008920",
+  baysideCensus: "1948020271",
+};
+
+const SYSTEM_PROMPT = `You are a client status assistant for Addiction Rehab Centers. You help staff quickly look up client information from monday.com boards AND CallRail call data.
+
+MONDAY.COM BOARDS:
+- Inpatient Leads (board 1514008919): inpatient lead pipeline
+- Bayside Leads (board 1947645460): Bayside lead pipeline
+- Inpatient Active Census (board 1514008920): current inpatient clients
+- Bayside Active Census (board 1948020271): current Bayside clients
+
+Key status values: New Lead, BD Referral, Incoming Online Lead, Waiting Medical, Waiting Clinical, Potential Admission, Scheduled Admission, Admitted Inpatient, Denied, Medical Denied, Clinician Denied, Detox Denial, Insurance Denial, Unqualified, Response Delayed / Unqualified, Approved Not Admitted, Unable To Make Contact, Converted To Lead.
+
+Important columns: lead_status (Status), text2__1 (Client Name), text1__1 (Client Phone), status_13__1 (Insurance Type), long_text__1 (Notes), date_mkvkva1d (P/A Date), date2__1 (Follow up date), people__1 (Owner), color_mknzpj24 (BD Rep Referral), status_11__1 (Lead Type), dropdown_mkr5eh7a (Client Category).
+
+CALLRAIL DATA:
+You will receive CallRail call history appended to the user message when available. It includes caller name, phone, duration, direction, source, answered status, tags, notes, and summaries.
+
+HOW TO RESPOND:
+- When asked about a client: Present their pipeline status from monday AND call history from CallRail together.
+- When asked for lists: Query the relevant boards and present results clearly.
+- When asked about calls: Show call timeline, patterns, summaries.
+- Cross-reference data: If monday says "Scheduled Admission" but CallRail shows no recent contact, flag it.
+- Be concise and professional. Use plain text, dashes, and line breaks for structure. No markdown formatting.`;
+
+const STATUS_COLORS = {
   "New Lead": { bg: "#fdab3d", text: "#000" },
   "Scheduled Admission": { bg: "#037f4c", text: "#fff" },
   "Potential Admission": { bg: "#ff6d3b", text: "#fff" },
@@ -14,224 +45,371 @@ var STATUS_COLORS = {
   "Unqualified": { bg: "#563e3e", text: "#fff" },
   "BD Referral": { bg: "#ff007f", text: "#fff" },
   "Incoming Online Lead": { bg: "#007eb5", text: "#fff" },
-  "Insurance Denial": { bg: "#4eccc6", text: "#000" }
+  "Insurance Denial": { bg: "#4eccc6", text: "#000" },
+  "Clinician Denied": { bg: "#7f5347", text: "#fff" },
+  "Detox Denial": { bg: "#c4c4c4", text: "#000" },
+  "Approved Not Admitted": { bg: "#e2445c", text: "#fff" },
+  "Unable To Make Contact": { bg: "#808080", text: "#fff" },
+  "Response Delayed": { bg: "#faa1f1", text: "#000" },
+  "Converted To Lead": { bg: "#66ccff", text: "#000" },
 };
 
-var QUICK_ACTIONS = [
-  { label: "Potential Admissions", query: "Show me all leads with Potential Admission status" },
-  { label: "Scheduled Admissions", query: "Show me all Scheduled Admissions" },
-  { label: "Waiting Medical", query: "Show me all leads in Waiting Medical status" },
-  { label: "Recent Calls", query: "Show me the 10 most recent calls" },
-  { label: "New Leads Today", query: "Show me any new leads from today" },
-  { label: "BD Referrals", query: "Show me all BD Referral leads" }
-];
-
-function StatusBadge(props) {
-  var c = STATUS_COLORS[props.status] || { bg: "#475569", text: "#fff" };
-  return React.createElement("span", {
-    style: { display: "inline-block", padding: "2px 10px", borderRadius: 20, fontSize: 11, fontWeight: 600, background: c.bg, color: c.text, whiteSpace: "nowrap" }
-  }, props.status);
+function StatusBadge({ status }) {
+  const c = STATUS_COLORS[status] || { bg: "#475569", text: "#fff" };
+  return (
+    <span style={{
+      display: "inline-block", padding: "1px 8px", borderRadius: 12, fontSize: 11,
+      fontWeight: 600, background: c.bg, color: c.text, whiteSpace: "nowrap", verticalAlign: "middle",
+    }}>{status}</span>
+  );
 }
 
-function formatMsg(text) {
-  var names = Object.keys(STATUS_COLORS);
-  var pat = new RegExp("\\b(" + names.join("|") + ")\\b", "g");
-  var parts = text.split(pat);
-  var out = [];
-  for (var i = 0; i < parts.length; i++) {
-    if (STATUS_COLORS[parts[i]]) {
-      out.push(React.createElement(StatusBadge, { key: i, status: parts[i] }));
-    } else {
-      out.push(React.createElement("span", { key: i }, parts[i]));
+function ThinkingIndicator({ phase }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px",
+      borderRadius: "14px 14px 14px 4px", background: "#1a1f2e", border: "1px solid #2a3040" }}>
+      <div style={{ display: "flex", gap: 3 }}>
+        {[0,1,2].map(i => (
+          <div key={i} style={{
+            width: 6, height: 6, borderRadius: "50%", background: "#6b8afd",
+            animation: `pulse 1.2s ease-in-out ${i * 0.15}s infinite`,
+          }} />
+        ))}
+      </div>
+      <span style={{ fontSize: 12, color: "#6b7a99" }}>{phase}</span>
+      <style>{`@keyframes pulse{0%,80%,100%{opacity:.25;transform:scale(.8)}40%{opacity:1;transform:scale(1.1)}}`}</style>
+    </div>
+  );
+}
+
+function parseSearchIntent(message) {
+  const msg = message.toLowerCase().trim();
+
+  const statusQueries = [
+    { patterns: ["potential admission", "potential"], status: "Potential Admission" },
+    { patterns: ["scheduled admission", "scheduled"], status: "Scheduled Admission" },
+    { patterns: ["waiting medical"], status: "Waiting Medical" },
+    { patterns: ["waiting clinical"], status: "Waiting Clinical" },
+    { patterns: ["new lead", "new leads"], status: "New Lead" },
+    { patterns: ["bd referral"], status: "BD Referral" },
+    { patterns: ["admitted", "inpatient"], status: "Admitted Inpatient" },
+    { patterns: ["denied"], status: "Denied" },
+    { patterns: ["unqualified"], status: "Unqualified" },
+  ];
+  for (const sq of statusQueries) {
+    if (sq.patterns.some(p => msg.includes(p)) && (msg.includes("show") || msg.includes("list") || msg.includes("all") || msg.includes("who"))) {
+      return { type: "status_list", status: sq.status };
     }
   }
-  return out;
+
+  if (msg.includes("recent call") || msg.includes("latest call") || msg.includes("last call") || msg.includes("calls from callrail")) {
+    return { type: "recent_calls" };
+  }
+
+  const namePatterns = [
+    /(?:status of|look up|find|search for|about|info on|check on|details for|calls?\s+(?:from|for|about|with))\s+([a-zA-Z][\w\s'-]+)/i,
+  ];
+  for (const pat of namePatterns) {
+    const m = message.match(pat);
+    if (m) return { type: "name_search", term: m[1].trim().replace(/[?.!]+$/, "") };
+  }
+
+  const phoneMatch = message.match(/(\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})/);
+  if (phoneMatch) return { type: "name_search", term: phoneMatch[1] };
+
+  const nameOnly = message.match(/^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\s*[?.!]*$/);
+  if (nameOnly) return { type: "name_search", term: nameOnly[1] };
+
+  return { type: "general", term: message.trim() };
 }
 
-function LoginScreen(props) {
-  var pwState = useState("");
-  var pw = pwState[0];
-  var setPw = pwState[1];
-  var errState = useState(false);
-  var error = errState[0];
-  var setError = errState[1];
-  var ldState = useState(false);
-  var ld = ldState[0];
-  var setLd = ldState[1];
-
-  var doLogin = function() {
-    setLd(true);
-    setError(false);
-    fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "auth", password: pw })
-    }).then(function(r) { return r.json(); }).then(function(d) {
-      if (d.authenticated) { props.onLogin(); } else { setError(true); }
-      setLd(false);
-    }).catch(function() { setError(true); setLd(false); });
-  };
-
-  return React.createElement("div", { style: { height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#0f172a", padding: 20 } },
-    React.createElement("div", { style: { textAlign: "center", maxWidth: 360, width: "100%" } },
-      React.createElement("div", { style: { width: 60, height: 60, borderRadius: 16, background: "linear-gradient(135deg, #3b82f6, #8b5cf6)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28, fontWeight: 700, color: "#fff", margin: "0 auto 20px" } }, "A"),
-      React.createElement("div", { style: { fontSize: 22, fontWeight: 700, color: "#f1f5f9", marginBottom: 6 } }, "ARC Client Lookup"),
-      React.createElement("div", { style: { fontSize: 13, color: "#64748b", marginBottom: 30 } }, "Enter your team password to continue"),
-      React.createElement("input", {
-        type: "password", value: pw,
-        onChange: function(e) { setPw(e.target.value); },
-        onKeyDown: function(e) { if (e.key === "Enter") doLogin(); },
-        placeholder: "Password",
-        style: { width: "100%", padding: "12px 16px", borderRadius: 12, border: error ? "1px solid #ef4444" : "1px solid #334155", background: "#1e293b", color: "#f1f5f9", fontSize: 14, outline: "none", boxSizing: "border-box", marginBottom: 12, fontFamily: "inherit" }
-      }),
-      error ? React.createElement("div", { style: { color: "#ef4444", fontSize: 12, marginBottom: 12 } }, "Incorrect password.") : null,
-      React.createElement("button", {
-        onClick: doLogin, disabled: ld || !pw.trim(),
-        style: { width: "100%", padding: "12px", borderRadius: 12, border: "none", background: ld || !pw.trim() ? "#334155" : "linear-gradient(135deg, #3b82f6, #6366f1)", color: "#fff", fontSize: 14, fontWeight: 600, cursor: ld || !pw.trim() ? "not-allowed" : "pointer", fontFamily: "inherit" }
-      }, ld ? "Checking..." : "Sign In")
-    )
-  );
+async function getCallRailAccountId() {
+  if (CALLRAIL_ACCOUNT_ID_CACHE.id) return CALLRAIL_ACCOUNT_ID_CACHE.id;
+  try {
+    const res = await fetch("https://api.callrail.com/v3/a.json", {
+      headers: { "Authorization": `Token token="${CALLRAIL_API_KEY}"` },
+    });
+    const data = await res.json();
+    if (data?.items?.[0]?.id) {
+      CALLRAIL_ACCOUNT_ID_CACHE.id = data.items[0].id;
+      return data.items[0].id;
+    }
+  } catch (e) {
+    console.error("CallRail account fetch error:", e);
+  }
+  return null;
 }
+
+async function fetchCallRailCalls(searchTerm, limit = 10) {
+  try {
+    const accountId = await getCallRailAccountId();
+    if (!accountId) return { error: "Could not connect to CallRail", calls: [] };
+
+    const fields = "duration,voicemail,summary,tags,note,score,customer_name,customer_phone_number,formatted_customer_phone_number,source,answered,first_call,start_time,direction,call_type";
+    let url = `https://api.callrail.com/v3/a/${accountId}/calls.json?per_page=${limit}&sort=start_time&order=desc&fields=${fields}`;
+    if (searchTerm) url += `&search=${encodeURIComponent(searchTerm)}`;
+
+    const res = await fetch(url, {
+      headers: { "Authorization": `Token token="${CALLRAIL_API_KEY}"` },
+    });
+    const data = await res.json();
+    return {
+      calls: data?.calls || [],
+      total: data?.total_records || 0,
+      error: null,
+    };
+  } catch (e) {
+    console.error("CallRail fetch error:", e);
+    return { error: "CallRail API error: " + e.message, calls: [] };
+  }
+}
+
+function formatCallRailContext(crData, searchTerm) {
+  if (crData.error) return `\n--- CALLRAIL ---\nError: ${crData.error}\n`;
+  if (!crData.calls.length) return `\n--- CALLRAIL ---\nNo calls found${searchTerm ? ` for "${searchTerm}"` : ""}.\n`;
+
+  let ctx = `\n--- CALLRAIL DATA (${crData.total || crData.calls.length} total) ---\n`;
+  for (const call of crData.calls) {
+    ctx += `- ${call.start_time || "N/A"} | ${call.customer_name || "Unknown"} | ${call.formatted_customer_phone_number || call.customer_phone_number || "N/A"} | ${call.direction || "?"} | ${call.duration != null ? Math.floor(call.duration / 60) + "m " + (call.duration % 60) + "s" : "N/A"} | Answered: ${call.answered ? "Yes" : "No"} | Source: ${call.source || "N/A"}`;
+    if (call.tags?.length) ctx += ` | Tags: ${call.tags.map(t => t.name || t).join(", ")}`;
+    if (call.note) ctx += ` | Note: ${call.note}`;
+    if (call.summary) ctx += ` | Summary: ${call.summary}`;
+    if (call.voicemail) ctx += ` | Voicemail: Yes`;
+    ctx += "\n";
+  }
+  return ctx;
+}
+
+const QUICK_ACTIONS = [
+  { label: "Potential Admissions", query: "Show me all Potential Admission leads" },
+  { label: "Scheduled Admissions", query: "Show me all Scheduled Admissions" },
+  { label: "Waiting Medical", query: "Show me all Waiting Medical leads" },
+  { label: "Recent Calls", query: "Show me the 10 most recent calls" },
+  { label: "New Leads", query: "Show me all New Leads" },
+  { label: "BD Referrals", query: "Show me all BD Referral leads" },
+];
 
 export default function Home() {
-  var authState = useState(false);
-  var authed = authState[0];
-  var setAuthed = authState[1];
-  var msgState = useState([]);
-  var messages = msgState[0];
-  var setMessages = msgState[1];
-  var inpState = useState("");
-  var input = inpState[0];
-  var setInput = inpState[1];
-  var ldState = useState(false);
-  var loading = ldState[0];
-  var setLoading = ldState[1];
-  var phState = useState("");
-  var phase = phState[0];
-  var setPhase = phState[1];
-  var chatEndRef = useRef(null);
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [phase, setPhase] = useState("");
+  const [crStatus, setCrStatus] = useState("checking");
+  const chatEndRef = useRef(null);
 
-  useEffect(function() {
-    if (chatEndRef.current) chatEndRef.current.scrollIntoView({ behavior: "smooth" });
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
-  if (!authed) return React.createElement(LoginScreen, { onLogin: function() { setAuthed(true); } });
+  useEffect(() => {
+    getCallRailAccountId().then(id => {
+      setCrStatus(id ? "connected" : "error");
+    }).catch(() => setCrStatus("error"));
+  }, []);
 
-  var sendMessage = function(text) {
+  const sendMessage = async (text) => {
     if (!text.trim() || loading) return;
-    var userMsg = { role: "user", content: text.trim() };
-    setMessages(function(p) { return p.concat([userMsg]); });
+    const userText = text.trim();
+    setMessages(prev => [...prev, { role: "user", content: userText }]);
     setInput("");
     setLoading(true);
-    setPhase("Searching monday.com & CallRail...");
-    fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text.trim(), history: messages.slice(-10).map(function(m) { return { role: m.role, content: m.content }; }) })
-    }).then(function(r) { return r.json(); }).then(function(data) {
-      if (data.error) {
-        setMessages(function(p) { return p.concat([{ role: "assistant", content: "Error: " + data.error }]); });
-      } else {
-        var src = [];
-        if (data.meta && data.meta.mondayResults > 0) src.push(data.meta.mondayResults + " monday.com");
-        if (data.meta && data.meta.callRailResults > 0) src.push(data.meta.callRailResults + " CallRail");
-        setMessages(function(p) { return p.concat([{ role: "assistant", content: data.reply, sources: src.length ? src.join(" + ") + " results" : null }]); });
+
+    try {
+      const intent = parseSearchIntent(userText);
+      let callRailContext = "";
+
+      if (intent.type === "name_search" && intent.term) {
+        setPhase("Searching CallRail for " + intent.term + "...");
+        const crData = await fetchCallRailCalls(intent.term);
+        callRailContext = formatCallRailContext(crData, intent.term);
+      } else if (intent.type === "recent_calls") {
+        setPhase("Fetching recent calls...");
+        const crData = await fetchCallRailCalls(null, 15);
+        callRailContext = formatCallRailContext(crData, null);
+      } else if (intent.type === "general") {
+        setPhase("Searching CallRail...");
+        const crData = await fetchCallRailCalls(intent.term);
+        callRailContext = formatCallRailContext(crData, intent.term);
       }
+
+      setPhase("Querying monday.com...");
+      let enrichedContent = userText;
+      if (callRailContext) enrichedContent += "\n" + callRailContext;
+
+      const conversationHistory = messages.map(m => ({ role: m.role, content: m.content }));
+      conversationHistory.push({ role: "user", content: enrichedContent });
+
+      setPhase("Analyzing data...");
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 1000,
+          system: SYSTEM_PROMPT,
+          messages: conversationHistory,
+          mcp_servers: [
+            { type: "url", url: "https://mcp.monday.com/mcp", name: "monday-mcp" },
+          ],
+        }),
+      });
+
+      const data = await response.json();
+
+      const textParts = data.content
+        ?.filter(b => b.type === "text")
+        .map(b => b.text)
+        .filter(Boolean);
+
+      const reply = textParts?.join("\n") || "I couldn't retrieve that information. Please try again.";
+      setMessages(prev => [...prev, { role: "assistant", content: reply }]);
+    } catch (err) {
+      console.error("Error:", err);
+      setMessages(prev => [...prev, { role: "assistant", content: "Something went wrong — " + err.message }]);
+    } finally {
       setLoading(false);
       setPhase("");
-    }).catch(function() {
-      setMessages(function(p) { return p.concat([{ role: "assistant", content: "Something went wrong. Please try again." }]); });
-      setLoading(false);
-      setPhase("");
-    });
+    }
   };
 
-  var header = React.createElement("div", { style: { padding: "14px 20px", borderBottom: "1px solid #1e293b", background: "linear-gradient(135deg, #0f172a, #1e293b)", flexShrink: 0 } },
-    React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12 } },
-      React.createElement("div", { style: { width: 40, height: 40, borderRadius: 10, background: "linear-gradient(135deg, #3b82f6, #8b5cf6)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 700, color: "#fff" } }, "A"),
-      React.createElement("div", { style: { flex: 1 } },
-        React.createElement("div", { style: { fontWeight: 700, fontSize: 17, color: "#f1f5f9" } }, "ARC Client Lookup"),
-        React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginTop: 2 } }, "monday.com + CallRail")
-      )
-    ),
-    React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 10 } },
-      ["monday.com", "CallRail"].map(function(label) {
-        return React.createElement("div", { key: label, style: { display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: "#22c55e", background: "#22c55e12", padding: "3px 10px", borderRadius: 20, border: "1px solid #22c55e30" } },
-          React.createElement("div", { style: { width: 6, height: 6, borderRadius: "50%", background: "#22c55e", boxShadow: "0 0 6px #22c55e60" } }),
-          label
-        );
-      })
-    )
-  );
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage(input);
+    }
+  };
 
-  var emptyState = messages.length === 0 ? React.createElement("div", { style: { flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", gap: 24, padding: "0 12px" } },
-    React.createElement("div", { style: { textAlign: "center" } },
-      React.createElement("div", { style: { fontSize: 32, marginBottom: 8 } }, "\uD83D\uDD0D"),
-      React.createElement("div", { style: { fontSize: 20, fontWeight: 700, color: "#f1f5f9", marginBottom: 6 } }, "Client Status Lookup"),
-      React.createElement("div", { style: { fontSize: 13, color: "#94a3b8", maxWidth: 400, lineHeight: 1.6 } }, "Search any client to see pipeline status, call history, and transcripts.")
-    ),
-    React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "center", maxWidth: 500 } },
-      QUICK_ACTIONS.map(function(qa) {
-        return React.createElement("button", {
-          key: qa.label, onClick: function() { sendMessage(qa.query); },
-          style: { padding: "8px 16px", borderRadius: 20, border: "1px solid #334155", background: "#1e293b", color: "#94a3b8", fontSize: 12, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }
-        }, qa.label);
-      })
-    )
-  ) : null;
-
-  var msgList = messages.map(function(msg, i) {
-    var isUser = msg.role === "user";
-    return React.createElement("div", { key: i, style: { display: "flex", justifyContent: isUser ? "flex-end" : "flex-start" } },
-      React.createElement("div", { style: { maxWidth: "85%" } },
-        React.createElement("div", {
-          style: {
-            padding: "10px 14px", fontSize: 13, lineHeight: 1.65, whiteSpace: "pre-wrap", wordBreak: "break-word",
-            borderRadius: isUser ? "16px 16px 4px 16px" : "16px 16px 16px 4px",
-            background: isUser ? "linear-gradient(135deg, #3b82f6, #6366f1)" : "#1e293b",
-            color: isUser ? "#fff" : "#e2e8f0",
-            border: isUser ? "none" : "1px solid #334155"
-          }
-        }, isUser ? msg.content : formatMsg(msg.content)),
-        msg.sources ? React.createElement("div", { style: { fontSize: 10, marginTop: 4, paddingLeft: 4, color: "#64748b" } }, "\uD83D\uDCCA " + msg.sources) : null
-      )
+  const formatMessage = (text) => {
+    const statusPattern = /\b(New Lead|Scheduled Admission|Potential Admission|Waiting Medical|Waiting Clinical|Admitted Inpatient|Denied|Medical Denied|Clinician Denied|Detox Denial|Insurance Denial|Unqualified|BD Referral|Incoming Online Lead|Response Delayed|Approved Not Admitted|Unable To Make Contact|Converted To Lead)\b/g;
+    return text.split(statusPattern).map((part, i) =>
+      part.match(statusPattern) ? <StatusBadge key={i} status={part} /> : <span key={i}>{part}</span>
     );
-  });
+  };
 
-  var loadingEl = loading ? React.createElement("div", { style: { display: "flex", justifyContent: "flex-start" } },
-    React.createElement("div", { style: { padding: "10px 14px", borderRadius: "16px 16px 16px 4px", background: "#1e293b", border: "1px solid #334155" } },
-      React.createElement("div", { style: { display: "flex", gap: 4, alignItems: "center", padding: "4px 0" } },
-        [0, 1, 2].map(function(i) { return React.createElement("div", { key: i, style: { width: 7, height: 7, borderRadius: "50%", background: "#64748b", animation: "pulse-dot 1.2s ease-in-out " + (i * 0.2) + "s infinite" } }); })
-      ),
-      React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginTop: 4 } }, phase)
-    )
-  ) : null;
+  const crDotColor = crStatus === "connected" ? "#22c55e" : crStatus === "error" ? "#ef4444" : "#f59e0b";
 
-  var inputBar = React.createElement("div", { style: { padding: "12px 16px 16px", borderTop: "1px solid #1e293b", background: "#0f172a", flexShrink: 0 } },
-    React.createElement("div", { style: { display: "flex", gap: 8, alignItems: "flex-end", background: "#1e293b", borderRadius: 14, padding: "6px 6px 6px 14px", border: "1px solid #334155" } },
-      React.createElement("input", {
-        value: input,
-        onChange: function(e) { setInput(e.target.value); },
-        onKeyDown: function(e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(input); } },
-        placeholder: "What's the status of John Smith?",
-        disabled: loading,
-        style: { flex: 1, background: "transparent", border: "none", outline: "none", color: "#e2e8f0", fontSize: 13, fontFamily: "inherit", padding: "6px 0" }
-      }),
-      React.createElement("button", {
-        onClick: function() { sendMessage(input); },
-        disabled: loading || !input.trim(),
-        style: { width: 36, height: 36, borderRadius: 10, border: "none", background: loading || !input.trim() ? "#334155" : "linear-gradient(135deg, #3b82f6, #6366f1)", color: "#fff", fontSize: 16, cursor: loading || !input.trim() ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }
-      }, "\u2191")
-    ),
-    React.createElement("div", { style: { textAlign: "center", fontSize: 10, color: "#475569", marginTop: 8 } }, "monday.com + CallRail")
-  );
+  return (
+    <div style={{
+      display: "flex", flexDirection: "column", height: "100vh", width: "100%",
+      background: "#0c1019", fontFamily: "'IBM Plex Sans', 'Segoe UI', system-ui, sans-serif", color: "#d0d8e8",
+    }}>
+      {/* Header */}
+      <div style={{
+        padding: "14px 20px", borderBottom: "1px solid #1c2333",
+        background: "linear-gradient(180deg, #111827 0%, #0c1019 100%)",
+        display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0,
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{
+            width: 32, height: 32, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center",
+            background: "linear-gradient(135deg, #3b6cf5, #8b5cf6)", fontSize: 15, fontWeight: 700, color: "#fff",
+          }}>A</div>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: "#e8ecf4", letterSpacing: "-0.01em" }}>
+              ARC Client Lookup
+            </div>
+            <div style={{ fontSize: 10, color: "#5c6b88", marginTop: 1 }}>
+              monday.com + CallRail
+            </div>
+          </div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 10, color: "#5c6b88" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#22c55e" }} />
+            monday.com
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <div style={{ width: 6, height: 6, borderRadius: "50%", background: crDotColor }} />
+            CallRail
+          </div>
+        </div>
+      </div>
 
-  return React.createElement("div", { style: { fontFamily: "'DM Sans', sans-serif", height: "100vh", display: "flex", flexDirection: "column", background: "#0f172a", color: "#e2e8f0" } },
-    header,
-    React.createElement("div", { style: { flex: 1, overflowY: "auto", padding: "16px 16px 8px", display: "flex", flexDirection: "column", gap: 12 } },
-      emptyState, msgList, loadingEl,
-      React.createElement("div", { ref: chatEndRef })
-    ),
-    inputBar
+      {/* Quick Actions */}
+      {messages.length === 0 && (
+        <div style={{ padding: "32px 20px", display: "flex", flexDirection: "column", alignItems: "center", gap: 20, flexShrink: 0 }}>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 18, fontWeight: 600, color: "#c8d0e0", marginBottom: 4 }}>Client Status Lookup</div>
+            <div style={{ fontSize: 12, color: "#5c6b88" }}>Search clients, view pipeline status, check call history</div>
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "center", maxWidth: 480 }}>
+            {QUICK_ACTIONS.map((qa, i) => (
+              <button key={i} onClick={() => sendMessage(qa.query)}
+                style={{
+                  padding: "7px 14px", borderRadius: 20, border: "1px solid #1e2a40",
+                  background: "#111827", color: "#8b9bc0", fontSize: 12, cursor: "pointer",
+                  transition: "all 0.15s", fontFamily: "inherit",
+                }}
+                onMouseEnter={e => { e.target.style.background = "#1a2540"; e.target.style.borderColor = "#2e4070"; e.target.style.color = "#a8b8e0"; }}
+                onMouseLeave={e => { e.target.style.background = "#111827"; e.target.style.borderColor = "#1e2a40"; e.target.style.color = "#8b9bc0"; }}
+              >{qa.label}</button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Chat Area */}
+      <div style={{
+        flex: 1, overflowY: "auto", padding: "16px 16px 8px",
+        display: "flex", flexDirection: "column", gap: 10,
+      }}>
+        {messages.map((msg, i) => (
+          <div key={i} style={{ display: "flex", justifyContent: msg.role === "user" ? "flex-end" : "flex-start" }}>
+            <div style={{
+              maxWidth: "85%", padding: "10px 14px",
+              borderRadius: msg.role === "user" ? "14px 14px 4px 14px" : "14px 14px 14px 4px",
+              background: msg.role === "user"
+                ? "linear-gradient(135deg, #3b6cf5, #5b4cf5)"
+                : "#1a1f2e",
+              color: msg.role === "user" ? "#fff" : "#c8d4e8",
+              fontSize: 13, lineHeight: 1.65, whiteSpace: "pre-wrap", wordBreak: "break-word",
+              border: msg.role === "user" ? "none" : "1px solid #242d40",
+            }}>
+              {msg.role === "assistant" ? formatMessage(msg.content) : msg.content}
+            </div>
+          </div>
+        ))}
+        {loading && (
+          <div style={{ display: "flex", justifyContent: "flex-start" }}>
+            <ThinkingIndicator phase={phase} />
+          </div>
+        )}
+        <div ref={chatEndRef} />
+      </div>
+
+      {/* Input */}
+      <div style={{ padding: "10px 16px 16px", borderTop: "1px solid #1c2333", background: "#0c1019", flexShrink: 0 }}>
+        <div style={{
+          display: "flex", gap: 8, alignItems: "flex-end",
+          background: "#111827", borderRadius: 14, padding: "5px 5px 5px 14px", border: "1px solid #1e2a40",
+        }}>
+          <input
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder='Search a client name, phone, or ask a question...'
+            disabled={loading}
+            style={{
+              flex: 1, background: "transparent", border: "none", outline: "none",
+              color: "#c8d4e8", fontSize: 13, fontFamily: "inherit", padding: "7px 0",
+            }}
+          />
+          <button
+            onClick={() => sendMessage(input)}
+            disabled={loading || !input.trim()}
+            style={{
+              width: 34, height: 34, borderRadius: 10, border: "none",
+              background: loading || !input.trim() ? "#1e2a40" : "linear-gradient(135deg, #3b6cf5, #5b4cf5)",
+              color: "#fff", fontSize: 15, cursor: loading || !input.trim() ? "not-allowed" : "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+              transition: "all 0.15s",
+            }}
+          >↑</button>
+        </div>
+        <div style={{ textAlign: "center", fontSize: 9, color: "#3a4560", marginTop: 6 }}>
+          Powered by Claude Haiku · monday.com + CallRail
+        </div>
+      </div>
+    </div>
   );
 }
